@@ -20,24 +20,91 @@ from ampel.pipeline.t0.alerts.TarAlertLoader import TarAlertLoader
 from ampel.archive import ArchiveDB
 
 def blobs_from_tarball(procnum, queue, date, partnership=True):
+	log = logging.getLogger()
 	i = 0
 	try:
 		if partnership:
 			url = 'https://ztf:16chipsOnPalomar@ztf.uw.edu/alerts/partnership/ztf_partnership_{}.tar.gz'.format(date)
 		else:
 			url = 'https://ztf.uw.edu/alerts/public/ztf_public_{}.tar.gz'.format(date)
-		response = requests.get(url, stream=True)
-		response.raise_for_status()
+		reader = RetryReader(url)
 		
-		loader = TarAlertLoader(file_obj=response.raw)
+		loader = TarAlertLoader(file_obj=reader)
 		for i, fileobj in enumerate(iter(loader)):
 			queue.put(fileobj.read())
 	except (tarfile.ReadError, requests.exceptions.HTTPError):
 		pass
+	except:
+		log.error('ztf_{}_{} failed after {} alerts'.format(['public', 'partnership'][partnership], date, i))
+		raise
 	finally:
 		if i > 0:
 			log.info('ztf_{}_{} finished ({} alerts)'.format(['public', 'partnership'][partnership], date, i))
 		queue.put(procnum)
+
+import io
+import requests
+from requests.packages.urllib3.exceptions import IncompleteRead, ProtocolError
+from requests.packages.urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+
+log = logging.getLogger()
+class RetryReader(io.IOBase):
+	def __init__(self, url):
+		retry = Retry(total=100, backoff_factor=0.1)
+		self._adapter = HTTPAdapter(max_retries=retry)
+		self._session = requests.Session()
+		self._session.mount('http://', self._adapter)
+		self._session.mount('https://', self._adapter)
+		self._url = url
+		self._open(url)
+		self._offset = 0
+	
+	def _open(self, url, start=None):
+		kwargs = dict(stream=True)
+		if start is not None:
+			kwargs['headers'] = {'Range': 'bytes={}-'.format(start)}
+			log.warn("Retrying {} with {}".format(self._url, kwargs['headers']))
+		self._response = self._session.get(url, **kwargs)
+		assert self._response.headers['Accept-Ranges'] == 'bytes'
+		# Force HTTPResponse.read() to raise an error if body is incomplete
+		self._response.raw.enforce_content_length = True
+		
+	def read(self, amt):
+		while True:
+			try:
+				return self._response.raw.read(amt)
+			except ProtocolError as err:
+				if isinstance(err.args[1], IncompleteRead):
+					incomplete = err.args[1]
+					# TODO increment retry here
+					self._adapter.max_retries = self._adapter.max_retries.increment(url=self._url, response=self._response.raw, error=incomplete)
+					self._offset += incomplete.partial
+					self._open(self._url, start=self._offset)
+					continue
+				else:
+					raise
+
+def slurp(args):
+	logging.basicConfig(level='INFO', format='%(asctime)s %(name)s:%(levelname)s: %(message)s')
+	log = logging.getLogger()
+	date = args.date
+	partnership = args.partnership
+	if partnership:
+		url = 'https://ztf:16chipsOnPalomar@ztf.uw.edu/alerts/partnership/ztf_partnership_{}.tar.gz'.format(date)
+	else:
+		url = 'https://ztf.uw.edu/alerts/public/ztf_public_{}.tar.gz'.format(date)
+	reader = RetryReader(url)
+	
+	loader = TarAlertLoader(file_obj=reader)
+	count = 0
+	for fileobj in iter(loader):
+		reader = fastavro.reader(fileobj)
+		next(reader)
+		count += 1
+		if (count) % 100 == 0:
+			log.info(count)
+	log.info('{}: {}'.format(url, count))
 
 from sqlalchemy import select, and_, bindparam, exists
 from sqlalchemy.sql.schema import UniqueConstraint
@@ -122,17 +189,24 @@ def recover(args):
 	log = logging.getLogger()
 
 	# Spawn 1 reader each for the public and private alerts of each night
-	begin = datetime.datetime(2018,6,1)
-	dates = [(begin + datetime.timedelta(i)).strftime('%Y%m%d') for i in range((datetime.datetime.now()- begin).days)]*2
-	input_queue = multiprocessing.Queue(10*args.workers)
-	sources = {i: multiprocessing.Process(target=blobs_from_tarball, args=(i,input_queue,date,i%2==0)) for i,date in enumerate(dates)}
+	input_queue = multiprocessing.Queue(10*args.input_workers)
+	if args.itemfile is None:
+		begin = datetime.datetime(2018,6,1)
+		dates = [(begin + datetime.timedelta(i)).strftime('%Y%m%d') for i in range((datetime.datetime.now()- begin).days)]*2
+		sources = {i: multiprocessing.Process(target=blobs_from_tarball, args=(i,input_queue,date,i%2==0)) for i,date in enumerate(dates)}
+	else:
+		sources = {}
+		for i, line in enumerate(args.itemfile):
+			name = line.strip()
+			date = name.split('_')[-1]
+			sources[i] = multiprocessing.Process(target=blobs_from_tarball, args=(i,input_queue,date,'partnership' in name))
 	for i, p in enumerate(sources.values()):
-		if i == args.workers:
+		if i == args.input_workers:
 			break
 		p.start()
 
-	output_queues = [multiprocessing.Queue(10) for i in range(args.workers)]
-	sinks = {i: multiprocessing.Process(target=ingest_blobs, args=(i,output_queues[i],args.archive)) for i in range(args.workers)}
+	output_queues = [multiprocessing.Queue(10) for i in range(args.output_workers)]
+	sinks = {i: multiprocessing.Process(target=ingest_blobs, args=(i,output_queues[i],args.archive)) for i in range(args.output_workers)}
 	for p in sinks.values():
 		p.start()
 
@@ -202,17 +276,24 @@ def check(args):
 				sys.stdout.flush()
 
 if __name__ == "__main__":
-	from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+	from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, FileType
 	parser = ArgumentParser(description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter)
 	parser.add_argument("--archive", type=str, default="localhost:5432")
 
 	subparsers = parser.add_subparsers()
 	p = subparsers.add_parser('recover')
 	p.set_defaults(func=recover)
-	p.add_argument("--workers", type=int, default=4, help="Number of db clients to start")
+	p.add_argument("--input-workers", type=int, default=4, help="Number of downloaders to start")
+	p.add_argument("--output-workers", type=int, default=8, help="Number of db clients to start")
+	p.add_argument("--itemfile", default=None, type=FileType('r'))
 
 	p = subparsers.add_parser('check')
 	p.set_defaults(func=check)
+
+	p = subparsers.add_parser('slurp')
+	p.set_defaults(func=slurp)
+	p.add_argument('date')
+	p.add_argument('--partnership', default=False, action='store_true')
 
 	args = parser.parse_args()
 	args.func(args)
