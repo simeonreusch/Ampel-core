@@ -217,7 +217,7 @@ class T2Worker(AbsWorker[T2Document]):
 		:param stock_updr: journal update service
 
 		Regarding tied T2s (unit depends on other T2s):
-		
+
 		- Dependent T2s will be executed if run_dependent_t2s is True.
 		- Note that the ingester ingests point and state t2s before state t2s so that the natural ordering
 		  of T2 docs to be processed fits rather well a setup with a single T2processor instance processing all T2s.
@@ -318,7 +318,11 @@ class T2Worker(AbsWorker[T2Document]):
 
 					queries.append(d)
 
-				qres = self.run_tied_queries(queries, t2_doc, stock_updr, logger)
+				# Perform tied queries if any requested for config
+				if len(queries)>0:
+					qres = self.run_tied_queries(queries, t2_doc, stock_updr, logger)
+				else:
+					qres = []
 
 				# Dependency missing
 				if isinstance(qres, UnitResult):
@@ -476,7 +480,7 @@ class T2Worker(AbsWorker[T2Document]):
 		:raises:
 			- ValueError if functionality is not implemented yet
 			- BadConfig if what's requested is not possible (a point T2 cannot be linked with a state t2)
-	
+
 		:returns: link value to match or None if further handling is required (state t2 linked with point t2)
 		"""
 
